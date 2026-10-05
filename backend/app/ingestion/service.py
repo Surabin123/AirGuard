@@ -8,6 +8,7 @@ import httpx
 from sqlalchemy import select
 
 from app.models import KnownEntity
+from app.core.realtime import runtime_metrics
 
 logger = logging.getLogger("airguard.ingestion")
 
@@ -42,6 +43,7 @@ class OpenSkyIngestionService:
         self.cooldown_duration = cooldown_seconds
         self.cooldown_until: float = 0.0
         self.backoff_seconds: float = 0.0
+        self.last_successful_poll: Optional[datetime] = None
 
     async def refresh_known_entities(self) -> None:
         """Fetch known entities from the database and refresh the in-memory cache."""
@@ -141,6 +143,8 @@ class OpenSkyIngestionService:
             "heading_deg": heading,
             "vertical_rate_ms": vertical_rate,
             "on_ground": on_ground,
+            "squawk": str(vector[14]).strip() if len(vector) > 14 and vector[14] is not None else None,
+            "spi": bool(vector[15]) if len(vector) > 15 and vector[15] is not None else False,
             "received_at": received_at,
             "source": "opensky",
             "metadata": {
@@ -219,6 +223,7 @@ class OpenSkyIngestionService:
         try:
             res = await self.client.get(self.opensky_url)
             latency = (time.time() - start_time) * 1000.0 # ms
+            runtime_metrics.last_poll_latency_ms = round(latency, 2)
             
             if res.status_code != 200:
                 raise httpx.HTTPStatusError(
@@ -231,6 +236,7 @@ class OpenSkyIngestionService:
             states = data.get("states") or []
             
             self.update_circuit_state_on_success()
+            self.last_successful_poll = datetime.now(timezone.utc)
             
             # Log structured poll metric
             logger.info(
@@ -247,6 +253,7 @@ class OpenSkyIngestionService:
             
         except Exception as e:
             latency = (time.time() - start_time) * 1000.0 # ms
+            runtime_metrics.last_poll_latency_ms = round(latency, 2)
             logger.error(
                 json.dumps({
                     "event": "POLL_METRICS",
@@ -268,6 +275,7 @@ class OpenSkyIngestionService:
             
         try:
             raw_states = await self.poll_api()
+            runtime_metrics.packets_received += len(raw_states)
             normalized_count = 0
             
             for vector in raw_states:
@@ -275,6 +283,9 @@ class OpenSkyIngestionService:
                 if normalized is not None:
                     await self.queue.put(normalized)
                     normalized_count += 1
+            runtime_metrics.packets_dropped += max(0, len(raw_states) - normalized_count)
+            runtime_metrics.last_event_at = datetime.now(timezone.utc)
+            runtime_metrics.source_status["opensky"] = "healthy"
                     
             return normalized_count
         except CircuitBreakerOpenException:

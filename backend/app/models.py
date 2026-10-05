@@ -19,8 +19,9 @@ class AircraftState(Base):
     heading_deg: Mapped[float] = mapped_column(Float)
     vertical_rate_ms: Mapped[float] = mapped_column(Float)
     on_ground: Mapped[bool] = mapped_column(Boolean)
+    squawk: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    source: Mapped[str] = mapped_column(String(20), default="opensky", server_default="opensky")
+    source: Mapped[str] = mapped_column(String(80), default="opensky", server_default="opensky")
 
     # Relationships
     alerts: Mapped[List["Alert"]] = relationship(back_populates="aircraft_state")
@@ -51,6 +52,34 @@ class Alert(Base):
     aircraft_state: Mapped["AircraftState"] = relationship(back_populates="alerts")
 
 
+class Incident(Base):
+    __tablename__ = "incidents"
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    icao24: Mapped[str] = mapped_column(String(6), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="new")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    risk_score: Mapped[float] = mapped_column(Float)
+    reason: Mapped[str] = mapped_column(Text)
+    rule_flags: Mapped[List[str]] = mapped_column(ARRAY(Text), default=list)
+    comments: Mapped[List[Dict[str, Any]]] = mapped_column(JSONB, default=list)
+    timeline: Mapped[List[Dict[str, Any]]] = mapped_column(JSONB, default=list)
+    source: Mapped[str] = mapped_column(String(80), default="unknown")
+
+
+class Geofence(Base):
+    __tablename__ = "geofences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    latitude: Mapped[float] = mapped_column(Float, nullable=False)
+    longitude: Mapped[float] = mapped_column(Float, nullable=False)
+    radius_km: Mapped[float] = mapped_column(Float, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ModelRun(Base):
     __tablename__ = "model_runs"
 
@@ -58,12 +87,12 @@ class ModelRun(Base):
     run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     model_version: Mapped[str] = mapped_column(String(20))
     true_positives: Mapped[int] = mapped_column(Integer)
-    false_positives: Mapped[int] = mapped_column(Integer)
-    true_negatives: Mapped[int] = mapped_column(Integer)
+    false_positives: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    true_negatives: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     false_negatives: Mapped[int] = mapped_column(Integer)
-    precision: Mapped[float] = mapped_column(Float)
-    recall: Mapped[float] = mapped_column(Float)
-    f1: Mapped[float] = mapped_column(Float)
+    precision: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    recall: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    f1: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     notes: Mapped[str] = mapped_column(Text)
 
 

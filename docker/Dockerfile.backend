@@ -31,6 +31,8 @@ ENV PATH="/backend/.venv/bin:$PATH"
 
 COPY --from=builder /backend/.venv /backend/.venv
 COPY backend/app ./app
+COPY backend/alembic.ini ./alembic.ini
+COPY backend/alembic ./alembic
 
 EXPOSE 8000
 

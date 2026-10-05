@@ -30,6 +30,8 @@ logger.addHandler(log_handler)
 logger.setLevel(settings.LOG_LEVEL)
 
 from app.core.queue import ingestion_queue
+from app.core.realtime import live_registry, runtime_metrics, utc_now
+from app.api.v1.endpoints import manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -62,12 +64,21 @@ async def lifespan(app: FastAPI):
     async def sync_stats_loop():
         while True:
             try:
-                SYSTEM_STATS["poll_latency_ms"] = 120.0  # default baseline
+                SYSTEM_STATS["poll_latency_ms"] = runtime_metrics.last_poll_latency_ms
                 SYSTEM_STATS["queue_depth"] = ingestion_queue.qsize()
                 SYSTEM_STATS["circuit_breaker_state"] = ingestion_service.breaker_state
                 SYSTEM_STATS["last_successful_poll"] = (
-                    datetime.now(timezone.utc) if ingestion_service.consecutive_failures == 0 else None
+                    ingestion_service.last_successful_poll
                 )
+                runtime_metrics.source_status["opensky"] = (
+                    "healthy" if ingestion_service.last_successful_poll and ingestion_service.consecutive_failures == 0
+                    else "degraded" if ingestion_service.consecutive_failures else "starting"
+                )
+                for state in await live_registry.mark_stale():
+                    await manager.broadcast({
+                        "event": "AIRCRAFT_STATUS_CHANGED",
+                        "payload": state,
+                    })
             except Exception:
                 pass
             await asyncio.sleep(2)

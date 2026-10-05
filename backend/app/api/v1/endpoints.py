@@ -5,6 +5,8 @@ from typing import List, Optional
 from datetime import datetime, timezone
 from io import BytesIO
 from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field
 
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -13,10 +15,60 @@ from reportlab.lib import colors
 
 from app.core.database import get_db
 from app.core.limiter import limiter
-from app.models import AircraftState, Alert, ModelRun
+from app.models import AircraftState, Alert, Geofence, Incident, ModelRun
 from app.api.schemas import AircraftStateResponse, AlertResponse, ModelRunResponse, SystemHealthResponse
+from app.core.realtime import incidents, live_registry, runtime_metrics
 
 router = APIRouter()
+
+
+class GeofencePayload(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    radius_km: float = Field(gt=0, le=500)
+    enabled: bool = True
+
+
+@router.get("/geofences")
+@limiter.limit("30/minute")
+async def list_geofences(request: Request, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Geofence).order_by(Geofence.id.asc()))
+    return result.scalars().all()
+
+
+@router.post("/geofences")
+@limiter.limit("20/minute")
+async def create_geofence(request: Request, payload: GeofencePayload, db: AsyncSession = Depends(get_db)):
+    geofence = Geofence(**payload.model_dump(), created_at=datetime.now(timezone.utc))
+    db.add(geofence)
+    await db.commit()
+    await db.refresh(geofence)
+    return geofence
+
+
+@router.patch("/geofences/{geofence_id}")
+@limiter.limit("30/minute")
+async def update_geofence(request: Request, geofence_id: int, payload: GeofencePayload, db: AsyncSession = Depends(get_db)):
+    geofence = await db.get(Geofence, geofence_id)
+    if not geofence:
+        raise HTTPException(status_code=404, detail="Geofence not found")
+    for key, value in payload.model_dump().items():
+        setattr(geofence, key, value)
+    await db.commit()
+    await db.refresh(geofence)
+    return geofence
+
+
+@router.delete("/geofences/{geofence_id}")
+@limiter.limit("20/minute")
+async def delete_geofence(request: Request, geofence_id: int, db: AsyncSession = Depends(get_db)):
+    geofence = await db.get(Geofence, geofence_id)
+    if not geofence:
+        raise HTTPException(status_code=404, detail="Geofence not found")
+    await db.delete(geofence)
+    await db.commit()
+    return {"deleted": True, "id": geofence_id}
 
 # Keep track of service startup time for session reporting
 START_TIME = datetime.now(timezone.utc)
@@ -37,17 +89,17 @@ class ConnectionManager:
     async def broadcast(self, message: dict):
         for connection in self.active_connections:
             try:
-                await connection.send_json(message)
+                await connection.send_json(jsonable_encoder(message))
             except Exception:
                 pass
 
 manager = ConnectionManager()
 
-# Global variables for system health polling (simulated/cached statistics)
+# Most recent values sampled from the active ingestion service.
 SYSTEM_STATS = {
-    "poll_latency_ms": 124.5,
+    "poll_latency_ms": 0.0,
     "queue_depth": 0,
-    "circuit_breaker_state": "CLOSED",
+    "circuit_breaker_state": "UNKNOWN",
     "last_successful_poll": None
 }
 
@@ -104,6 +156,26 @@ async def get_aircraft_history(
         .limit(limit)
         .offset(offset)
     )
+    return result.scalars().all()
+
+
+@router.get("/aircraft/{icao24}/replay", response_model=List[AircraftStateResponse])
+@limiter.limit("20/minute")
+async def replay_aircraft_history(
+    request: Request,
+    icao24: str,
+    start: Optional[datetime] = Query(default=None),
+    end: Optional[datetime] = Query(default=None),
+    limit: int = Query(default=1000, ge=1, le=10000),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return only recorded telemetry in event-time order."""
+    query = select(AircraftState).where(AircraftState.icao24 == icao24.lower())
+    if start:
+        query = query.where(AircraftState.received_at >= start)
+    if end:
+        query = query.where(AircraftState.received_at <= end)
+    result = await db.execute(query.order_by(AircraftState.received_at.asc()).limit(limit))
     return result.scalars().all()
 
 
@@ -170,12 +242,38 @@ async def get_model_runs(
 @limiter.limit("60/minute")
 async def get_system_health(request: Request):
     """Get system ingestion statistics, queue depths, and circuit-breaker status."""
+    live_states = await live_registry.snapshot()
+    stale_count = sum(1 for state in live_states if state.get("status") in {"stale", "lost"})
     return SystemHealthResponse(
         poll_latency_ms=SYSTEM_STATS["poll_latency_ms"],
         queue_depth=SYSTEM_STATS["queue_depth"],
         circuit_breaker_state=SYSTEM_STATS["circuit_breaker_state"],
-        last_successful_poll=SYSTEM_STATS["last_successful_poll"]
+        last_successful_poll=SYSTEM_STATS["last_successful_poll"],
+        packets_received=runtime_metrics.packets_received,
+        packets_processed=runtime_metrics.packets_processed,
+        packets_dropped=runtime_metrics.packets_dropped,
+        alerts_triggered=runtime_metrics.alerts_triggered,
+        active_aircraft=len(live_states),
+        stale_aircraft=stale_count,
+        last_event_at=runtime_metrics.last_event_at,
+        source_status=dict(runtime_metrics.source_status)
     )
+
+
+@router.get("/live-aircraft")
+@limiter.limit("60/minute")
+async def get_live_aircraft(request: Request):
+    """Return the current operational aircraft registry, including freshness."""
+    return await live_registry.snapshot()
+
+
+@router.get("/live-aircraft/{icao24}")
+@limiter.limit("60/minute")
+async def get_live_aircraft_detail(request: Request, icao24: str):
+    state = await live_registry.get(icao24)
+    if not state:
+        raise HTTPException(status_code=404, detail="Aircraft is not currently tracked")
+    return state
 
 
 @router.websocket("/stream")
@@ -190,125 +288,132 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
-from pydantic import BaseModel
-from app.core.queue import ingestion_queue
-from datetime import timedelta
-
-class InjectionPayload(BaseModel):
+class TelemetryPayload(BaseModel):
+    """Normalized telemetry contract for live, authorized data sources."""
     icao24: str
-    type: str # position_jump, duplicate_icao, impossible_climb, altitude_velocity_mismatch
-    callsign: Optional[str] = "SYNTH1"
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    altitude_m: float = 0.0
+    velocity_ms: float = 0.0
+    heading_deg: float = 0.0
+    vertical_rate_ms: float = 0.0
+    on_ground: bool = False
+    squawk: Optional[str] = Field(default=None, pattern=r"^\d{4}$")
+    callsign: Optional[str] = None
+    received_at: Optional[datetime] = None
+    source: str = Field(default="external", min_length=1, max_length=40)
+    receiver_id: Optional[str] = Field(default=None, max_length=30)
+    planned_route: Optional[List["RouteWaypoint"]] = Field(default=None, min_length=2)
+    route_tolerance_nm: float = Field(default=10.0, gt=0, le=100)
+
+
+class RouteWaypoint(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
+
+TelemetryPayload.model_rebuild()
 
 @router.post("/inject")
 @limiter.limit("60/minute")
-async def inject_anomaly(
-    request: Request,
-    payload: InjectionPayload,
-    db: AsyncSession = Depends(get_db)
-):
-    """Programmatically inject an anomaly through the ingestion queue."""
-    icao24 = payload.icao24.lower()
-    
-    # Query latest state from database for context
-    result = await db.execute(
-        select(AircraftState)
-        .where(AircraftState.icao24 == icao24)
-        .order_by(AircraftState.received_at.desc())
-        .limit(1)
-    )
-    prev = result.scalar_one_or_none()
-    
-    now = datetime.now(timezone.utc)
-    
-    # Baseline coordinates
-    lat = prev.latitude if prev else 37.7749
-    lng = prev.longitude if prev else -122.4194
-    alt = prev.altitude_m if prev else 10000.0
-    vel = prev.velocity_ms if prev else 250.0
-    hdg = prev.heading_deg if prev else 180.0
-    v_rate = prev.vertical_rate_ms if prev else 0.0
-    ground = prev.on_ground if prev else False
-    
-    states_to_inject = []
-    prev_time = now
-    
-    # If no previous state exists in DB, we inject a normal baseline state first
-    # so that the delta-based checks (position jump, duplicate ICAO) have context!
-    if not prev:
-        baseline_time = now - timedelta(seconds=10)
-        baseline = {
-            "icao24": icao24,
-            "callsign": payload.callsign,
-            "latitude": lat,
-            "longitude": lng,
-            "altitude_m": alt,
-            "velocity_ms": vel,
-            "heading_deg": hdg,
-            "vertical_rate_ms": v_rate,
-            "on_ground": ground,
-            "received_at": baseline_time,
-            "source": "opensky",
-            "metadata": {"is_known_entity": False, "known_entity_label": None, "is_synthetic": True}
-        }
-        states_to_inject.append(baseline)
-        prev_time = baseline_time
-    else:
-        prev_time = prev.received_at
+async def inject_anomaly(request: Request):
+    """Synthetic injection is disabled; live telemetry must come from an authorized source."""
+    raise HTTPException(status_code=410, detail="Synthetic anomaly injection is disabled. Submit real normalized telemetry to /api/v1/ingest.")
 
-    # Construct the anomalous state
-    if payload.type == "position_jump":
-        lat = lat + 5.0
-        received_time = prev_time + timedelta(seconds=10)
-    elif payload.type == "duplicate_icao":
-        lat = lat + 1.0
-        received_time = prev_time
-    elif payload.type == "impossible_climb":
-        v_rate = 80.0
-        received_time = now
-    elif payload.type == "altitude_velocity_mismatch":
-        ground = True
-        alt = 5000.0
-        vel = 250.0
-        received_time = now
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported anomaly type: {payload.type}")
-        
-    anomaly = {
-        "icao24": icao24,
-        "callsign": payload.callsign,
-        "latitude": lat,
-        "longitude": lng,
-        "altitude_m": alt,
-        "velocity_ms": vel,
-        "heading_deg": hdg,
-        "vertical_rate_ms": v_rate,
-        "on_ground": ground,
-        "received_at": received_time,
-        "source": "opensky",
-        "metadata": {"is_known_entity": False, "known_entity_label": None, "is_synthetic": True}
-    }
-    states_to_inject.append(anomaly)
-    
-    # Put records on queue
-    for state in states_to_inject:
-        await ingestion_queue.put(state)
-        
+
+@router.post("/ingest")
+@limiter.limit("600/minute")
+async def ingest_telemetry(request: Request, payload: TelemetryPayload):
+    """Ingest one normalized live state from an SDR bridge or another feed."""
+    record = payload.model_dump()
+    record["icao24"] = record["icao24"].strip().lower()
+    record["received_at"] = record["received_at"] or datetime.now(timezone.utc)
+    record["metadata"] = {"is_known_entity": False, "known_entity_label": None}
+    record["source"] = payload.source if not payload.receiver_id else f"{payload.source}:{payload.receiver_id}"
+    runtime_metrics.packets_received += 1
+    runtime_metrics.source_status[payload.source] = "healthy"
+    await ingestion_queue.put(record)
+    return {"status": "accepted", "icao24": record["icao24"], "source": payload.source}
+
+
+@router.get("/incidents")
+@limiter.limit("60/minute")
+async def get_incidents(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Incident).order_by(Incident.created_at.desc()).limit(limit))
+    return result.scalars().all()
+
+
+class IncidentUpdatePayload(BaseModel):
+    status: str
+    comment: Optional[str] = None
+
+
+@router.get("/capabilities")
+@limiter.limit("60/minute")
+async def get_live_capabilities(request: Request):
     return {
-        "status": "injected",
-        "anomaly_type": payload.type,
-        "icao24": icao24,
-        "records_count": len(states_to_inject),
-        "details": {
-            "icao24": anomaly["icao24"],
-            "latitude": anomaly["latitude"],
-            "longitude": anomaly["longitude"],
-            "altitude_m": anomaly["altitude_m"],
-            "velocity_ms": anomaly["velocity_ms"],
-            "vertical_rate_ms": anomaly["vertical_rate_ms"],
-            "on_ground": anomaly["on_ground"],
-            "received_at": anomaly["received_at"].isoformat()
-        }
+        "live_state_fields": ["position", "altitude", "velocity", "vertical_rate", "squawk", "source"],
+        "emergency_squawk_codes": ["7500", "7600", "7700"],
+        "rapid_descent_detection": True,
+        "filed_route_deviation": {
+            "available": True,
+            "requires_input": "planned_route on POST /ingest from a filed-flight-plan provider",
+            "provided_by_opensky_state_vectors": False,
+        },
+        "historical_replay": "recorded_database_telemetry_only",
+        "incident_timeline": "postgresql_persisted",
+        "diversion_airports": {
+            "available": False,
+            "reason": "No airport, runway availability, or operational suitability provider is configured.",
+        },
     }
+
+
+@router.post("/incidents/{incident_id}")
+@limiter.limit("60/minute")
+async def update_incident(
+    request: Request,
+    incident_id: str,
+    payload: IncidentUpdatePayload,
+    db: AsyncSession = Depends(get_db),
+):
+    if payload.status not in {"new", "investigating", "acknowledged", "resolved", "archived"}:
+        raise HTTPException(status_code=400, detail="Unsupported incident status")
+    result = await db.execute(select(Incident).where(Incident.id == incident_id))
+    incident = result.scalar_one_or_none()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    at = datetime.now(timezone.utc)
+    incident.status = payload.status
+    incident.updated_at = at
+    timeline = list(incident.timeline or [])
+    timeline.append({
+        "at": at.isoformat(),
+        "type": "operator_status_change",
+        "signals": [f"status:{payload.status}"],
+    })
+    incident.timeline = timeline
+    if payload.comment:
+        comments = list(incident.comments or [])
+        comments.append({"at": at.isoformat(), "text": payload.comment})
+        incident.comments = comments
+        incident.timeline = timeline + [{"at": at.isoformat(), "type": "operator_comment", "text": payload.comment, "signals": []}]
+    await db.commit()
+    await db.refresh(incident)
+    incident_payload = {
+        "id": incident.id, "icao24": incident.icao24, "status": incident.status,
+        "created_at": incident.created_at.isoformat(), "updated_at": incident.updated_at.isoformat(),
+        "risk_score": incident.risk_score, "reason": incident.reason,
+        "rule_flags": incident.rule_flags, "comments": incident.comments,
+        "timeline": incident.timeline, "source": incident.source,
+    }
+    incidents[incident.id] = incident_payload
+    await manager.broadcast({"event": "INCIDENT_UPDATED", "payload": incident_payload})
+    return incident_payload
 
 
 @router.get("/reports/session")
@@ -452,9 +557,9 @@ async def generate_session_report(
         mr_data = [
             [Paragraph("Attribute", bold_body_style), Paragraph("Value", bold_body_style)],
             [Paragraph("Model Version", body_style), Paragraph(latest_run.model_version, body_style)],
-            [Paragraph("Precision", body_style), Paragraph(f"{latest_run.precision:.4f}", body_style)],
-            [Paragraph("Recall", body_style), Paragraph(f"{latest_run.recall:.4f}", body_style)],
-            [Paragraph("F1 Score", body_style), Paragraph(f"{latest_run.f1:.4f}", body_style)],
+            [Paragraph("Precision", body_style), Paragraph(f"{latest_run.precision:.4f}" if latest_run.precision is not None else "Unavailable (no labeled normal samples)", body_style)],
+            [Paragraph("Recall", body_style), Paragraph(f"{latest_run.recall:.4f}" if latest_run.recall is not None else "Unavailable (no labeled anomaly samples)", body_style)],
+            [Paragraph("F1 Score", body_style), Paragraph(f"{latest_run.f1:.4f}" if latest_run.f1 is not None else "Unavailable (requires both labeled classes)", body_style)],
             [Paragraph("Notes / Training Set size", body_style), Paragraph(latest_run.notes or "N/A", body_style)],
         ]
     else:
@@ -553,7 +658,7 @@ async def replay_session_validation(
     request: Request,
     db: AsyncSession = Depends(get_db)
 ):
-    """Replay historical sessions against the active config, computing updated precision/recall."""
+    """Replay stored telemetry; calculate only metrics supported by recorded labels."""
     # 1. Fetch historical states and alerts
     states_result = await db.execute(
         select(AircraftState).order_by(AircraftState.icao24, AircraftState.received_at.asc())
@@ -568,7 +673,7 @@ async def replay_session_validation(
     # Map state_id to whether it was a ground truth synthetic anomaly
     synthetic_state_ids = {a.aircraft_state_id for a in all_alerts if a.is_synthetic}
 
-    TP, FP, TN, FN = 0, 0, 0, 0
+    TP, FN = 0, 0
 
     # We evaluate sequentially grouped by ICAO to handle history-based checks (jump, duplicate)
     icao_histories = {}
@@ -601,37 +706,34 @@ async def replay_session_validation(
             )
 
         predicted_anomaly = rule_climb or rule_alt_vel or rule_jump or rule_dup
-        ground_truth_anomaly = state.id in synthetic_state_ids
-
-        if ground_truth_anomaly and predicted_anomaly:
-            TP += 1
-        elif not ground_truth_anomaly and predicted_anomaly:
-            FP += 1
-        elif ground_truth_anomaly and not predicted_anomaly:
-            FN += 1
-        else:
-            TN += 1
+        # Unlabeled live traffic is not ground truth negative data. Only explicitly
+        # labeled synthetic anomaly observations can contribute to recall here.
+        if state.id in synthetic_state_ids:
+            if predicted_anomaly:
+                TP += 1
+            else:
+                FN += 1
 
         history.append(state)
         icao_histories[icao] = history
 
     # Calculate metrics
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 1.0
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 1.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 1.0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else None
 
     # 2. Write new ModelRun row
     db_run = ModelRun(
         run_at=datetime.now(timezone.utc),
         model_version="Replay-Config",
         true_positives=TP,
-        false_positives=FP,
-        true_negatives=TN,
+        false_positives=None,
+        true_negatives=None,
         false_negatives=FN,
-        precision=precision,
+        precision=None,
         recall=recall,
-        f1=f1,
-        notes=f"Replay thresholds: climb={active_rule_config.max_vertical_rate_ms}m/s, speed={active_rule_config.max_implied_speed_kmh}km/h"
+        f1=None,
+        notes=(f"Positive-only labeled replay: {TP + FN} labeled anomalies; recall is measurable. "
+               "Precision/F1 and false-positive/true-negative counts require labeled normal observations. "
+               f"Thresholds: climb={active_rule_config.max_vertical_rate_ms}m/s, speed={active_rule_config.max_implied_speed_kmh}km/h")
     )
     db.add(db_run)
     await db.commit()

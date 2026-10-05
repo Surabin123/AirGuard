@@ -13,6 +13,7 @@ class AircraftStateResponse(BaseModel):
     heading_deg: float
     vertical_rate_ms: float
     on_ground: bool
+    squawk: Optional[str] = None
     received_at: datetime
     source: str
 
@@ -49,12 +50,12 @@ class ModelRunResponse(BaseModel):
     run_at: datetime
     model_version: str
     true_positives: int
-    false_positives: int
-    true_negatives: int
+    false_positives: Optional[int] = None
+    true_negatives: Optional[int] = None
     false_negatives: int
-    precision: float
-    recall: float
-    f1: float
+    precision: Optional[float] = None
+    recall: Optional[float] = None
+    f1: Optional[float] = None
     notes: str
 
     model_config = {
@@ -69,6 +70,14 @@ class SystemHealthResponse(BaseModel):
     queue_depth: int
     circuit_breaker_state: str
     last_successful_poll: Optional[datetime] = None
+    packets_received: int = 0
+    packets_processed: int = 0
+    packets_dropped: int = 0
+    alerts_triggered: int = 0
+    active_aircraft: int = 0
+    stale_aircraft: int = 0
+    last_event_at: Optional[datetime] = None
+    source_status: Dict[str, str] = {}
 
     model_config = {
         "strict": True,
