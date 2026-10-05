@@ -3,6 +3,7 @@
 This module intentionally keeps only the current operational state in memory;
 the database remains the source of truth for historical telemetry and alerts.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -19,9 +20,13 @@ class LiveAircraftRegistry:
         self._states: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
-    async def upsert(self, record: Dict[str, Any], risk_score: float = 0.0,
-                     rule_flags: Optional[list[str]] = None,
-                     source: Optional[str] = None) -> Dict[str, Any]:
+    async def upsert(
+        self,
+        record: Dict[str, Any],
+        risk_score: float = 0.0,
+        rule_flags: Optional[list[str]] = None,
+        source: Optional[str] = None,
+    ) -> Dict[str, Any]:
         icao24 = record["icao24"].lower()
         now = utc_now()
         async with self._lock:
@@ -58,7 +63,11 @@ class LiveAircraftRegistry:
             state["sources"] = sorted(sources)
             state["sensor_consensus"] = round(min(1.0, len(sources) / 3.0), 2)
             previous_callsign = (previous or {}).get("callsign")
-            state["identity_conflict"] = bool(previous_callsign and state["callsign"] and previous_callsign != state["callsign"])
+            state["identity_conflict"] = bool(
+                previous_callsign
+                and state["callsign"]
+                and previous_callsign != state["callsign"]
+            )
             if previous:
                 state["previous_latitude"] = previous["latitude"]
                 state["previous_longitude"] = previous["longitude"]
@@ -75,14 +84,19 @@ class LiveAircraftRegistry:
             state["events"] = events[-100:]
             return dict(event)
 
-    async def mark_stale(self, stale_after_seconds: float = 45.0,
-                         lost_after_seconds: float = 120.0) -> list[Dict[str, Any]]:
+    async def mark_stale(
+        self, stale_after_seconds: float = 45.0, lost_after_seconds: float = 120.0
+    ) -> list[Dict[str, Any]]:
         now = utc_now()
         changed: list[Dict[str, Any]] = []
         async with self._lock:
             for state in self._states.values():
                 age = (now - state["last_seen_at"]).total_seconds()
-                new_status = "lost" if age >= lost_after_seconds else "stale" if age >= stale_after_seconds else "live"
+                new_status = (
+                    "lost"
+                    if age >= lost_after_seconds
+                    else "stale" if age >= stale_after_seconds else "live"
+                )
                 if state["status"] != new_status:
                     state["status"] = new_status
                     state["age_seconds"] = round(age, 1)
@@ -109,7 +123,10 @@ class RuntimeMetrics:
         self.last_event_at: Optional[datetime] = None
         self.last_processing_ms = 0.0
         self.last_poll_latency_ms = 0.0
-        self.source_status: Dict[str, str] = {"opensky": "starting", "local_sdr": "not_configured"}
+        self.source_status: Dict[str, str] = {
+            "opensky": "starting",
+            "local_sdr": "not_configured",
+        }
 
 
 live_registry = LiveAircraftRegistry()

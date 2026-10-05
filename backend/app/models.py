@@ -1,10 +1,21 @@
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from sqlalchemy import String, Float, Boolean, DateTime, Text, BigInteger, Integer, ForeignKey, Index
+from sqlalchemy import (
+    String,
+    Float,
+    Boolean,
+    DateTime,
+    Text,
+    BigInteger,
+    Integer,
+    ForeignKey,
+    Index,
+)
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+
 
 class AircraftState(Base):
     __tablename__ = "aircraft_states"
@@ -21,7 +32,9 @@ class AircraftState(Base):
     on_ground: Mapped[bool] = mapped_column(Boolean)
     squawk: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    source: Mapped[str] = mapped_column(String(80), default="opensky", server_default="opensky")
+    source: Mapped[str] = mapped_column(
+        String(80), default="opensky", server_default="opensky"
+    )
 
     # Relationships
     alerts: Mapped[List["Alert"]] = relationship(back_populates="aircraft_state")
@@ -37,7 +50,9 @@ class Alert(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     icao24: Mapped[str] = mapped_column(String(6))
-    aircraft_state_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("aircraft_states.id"), nullable=False)
+    aircraft_state_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("aircraft_states.id"), nullable=False
+    )
     rule_flags: Mapped[List[str]] = mapped_column(ARRAY(Text))
     ensemble_score: Mapped[float] = mapped_column(Float)
     autoencoder_score: Mapped[float] = mapped_column(Float)
@@ -45,8 +60,12 @@ class Alert(Base):
     reason_text: Mapped[str] = mapped_column(Text)
     shap_explanation: Mapped[Dict[str, Any]] = mapped_column(JSONB)
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    is_synthetic: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
-    acknowledged: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    is_synthetic: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    acknowledged: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
 
     # Relationships
     aircraft_state: Mapped["AircraftState"] = relationship(back_populates="alerts")
@@ -76,8 +95,12 @@ class Geofence(Base):
     latitude: Mapped[float] = mapped_column(Float, nullable=False)
     longitude: Mapped[float] = mapped_column(Float, nullable=False)
     radius_km: Mapped[float] = mapped_column(Float, nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
 
 
 class ModelRun(Base):

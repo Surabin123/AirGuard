@@ -12,8 +12,10 @@ from app.core.realtime import runtime_metrics
 
 logger = logging.getLogger("airguard.ingestion")
 
+
 class CircuitBreakerOpenException(Exception):
     pass
+
 
 class OpenSkyIngestionService:
     def __init__(
@@ -23,21 +25,21 @@ class OpenSkyIngestionService:
         poll_interval_seconds: float = 8.0,
         opensky_url: str = "https://opensky-network.org/api/states/all",
         max_retries: int = 5,
-        cooldown_seconds: float = 60.0
+        cooldown_seconds: float = 60.0,
     ):
         self.queue = queue
         self.db_session_maker = db_session_maker
         self.poll_interval = poll_interval_seconds
         self.opensky_url = opensky_url
-        
+
         # Ingestion Client
         self.client = httpx.AsyncClient(timeout=10.0)
-        
+
         # Known Entities Cache
-        self.known_entities: Dict[str, str] = {} # icao24 -> label
-        
+        self.known_entities: Dict[str, str] = {}  # icao24 -> label
+
         # Reliability Control State
-        self.breaker_state = "CLOSED" # CLOSED, OPEN, HALF_OPEN
+        self.breaker_state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
         self.consecutive_failures = 0
         self.max_retries = max_retries
         self.cooldown_duration = cooldown_seconds
@@ -52,7 +54,9 @@ class OpenSkyIngestionService:
                 result = await session.execute(select(KnownEntity))
                 entities = result.scalars().all()
                 self.known_entities = {e.icao24.lower(): e.label for e in entities}
-                logger.info(f"Refreshed known entities cache. Loaded {len(self.known_entities)} records.")
+                logger.info(
+                    f"Refreshed known entities cache. Loaded {len(self.known_entities)} records."
+                )
         except Exception as e:
             logger.error(f"Failed to refresh known entities from database: {e}")
 
@@ -121,16 +125,18 @@ class OpenSkyIngestionService:
         # Cross-reference with Known Entities cache
         known_label = self.known_entities.get(icao24)
         is_known = known_label is not None
-        
+
         if is_known:
             # Explicitly log suppression tag
             logger.info(
-                json.dumps({
-                    "event": "SUPPRESSION",
-                    "icao24": icao24,
-                    "label": known_label,
-                    "message": f"[SUPPRESSION] Target flagged as known entity: {known_label}. Downstream checks bypassed."
-                })
+                json.dumps(
+                    {
+                        "event": "SUPPRESSION",
+                        "icao24": icao24,
+                        "label": known_label,
+                        "message": f"[SUPPRESSION] Target flagged as known entity: {known_label}. Downstream checks bypassed.",
+                    }
+                )
             )
 
         return {
@@ -143,54 +149,68 @@ class OpenSkyIngestionService:
             "heading_deg": heading,
             "vertical_rate_ms": vertical_rate,
             "on_ground": on_ground,
-            "squawk": str(vector[14]).strip() if len(vector) > 14 and vector[14] is not None else None,
-            "spi": bool(vector[15]) if len(vector) > 15 and vector[15] is not None else False,
+            "squawk": (
+                str(vector[14]).strip()
+                if len(vector) > 14 and vector[14] is not None
+                else None
+            ),
+            "spi": (
+                bool(vector[15])
+                if len(vector) > 15 and vector[15] is not None
+                else False
+            ),
             "received_at": received_at,
             "source": "opensky",
             "metadata": {
                 "is_known_entity": is_known,
-                "known_entity_label": known_label
-            }
+                "known_entity_label": known_label,
+            },
         }
 
     def update_circuit_state_on_failure(self) -> None:
         """Increment failure state, calculate backoff, and trip breaker if threshold hit."""
         self.consecutive_failures += 1
-        
+
         if self.consecutive_failures >= self.max_retries:
             self.breaker_state = "OPEN"
             self.cooldown_until = time.time() + self.cooldown_duration
             self.backoff_seconds = 0.0
             logger.warning(
-                json.dumps({
-                    "event": "CIRCUIT_TRIPPED",
-                    "breaker_state": self.breaker_state,
-                    "cooldown_until": self.cooldown_until,
-                    "consecutive_failures": self.consecutive_failures,
-                    "message": f"Circuit breaker tripped to OPEN. Cooldown active for {self.cooldown_duration}s."
-                })
+                json.dumps(
+                    {
+                        "event": "CIRCUIT_TRIPPED",
+                        "breaker_state": self.breaker_state,
+                        "cooldown_until": self.cooldown_until,
+                        "consecutive_failures": self.consecutive_failures,
+                        "message": f"Circuit breaker tripped to OPEN. Cooldown active for {self.cooldown_duration}s.",
+                    }
+                )
             )
         else:
             # Exponential backoff base 2s (e.g. 2s, 4s, 8s, 16s)
-            self.backoff_seconds = 2.0 ** self.consecutive_failures
+            self.backoff_seconds = 2.0**self.consecutive_failures
             logger.info(
-                json.dumps({
-                    "event": "BACKOFF_ENGAGED",
-                    "consecutive_failures": self.consecutive_failures,
-                    "backoff_seconds": self.backoff_seconds,
-                    "message": f"Polled failed. Engaging exponential backoff for {self.backoff_seconds}s."
-                })
+                json.dumps(
+                    {
+                        "event": "BACKOFF_ENGAGED",
+                        "consecutive_failures": self.consecutive_failures,
+                        "backoff_seconds": self.backoff_seconds,
+                        "message": f"Polled failed. Engaging exponential backoff for {self.backoff_seconds}s.",
+                    }
+                )
             )
 
     def update_circuit_state_on_success(self) -> None:
         """Reset failure counters and restore breaker state to CLOSED."""
         if self.breaker_state != "CLOSED":
             logger.info(
-                json.dumps({
-                    "event": "CIRCUIT_CLOSED",
-                    "breaker_state": "CLOSED",
-                    "message": "Circuit breaker restored to CLOSED state."
-                })
+                json.dumps(
+                    {
+                        "event": "CIRCUIT_CLOSED",
+                        "breaker_state": "CLOSED",
+                        "message": "Circuit breaker restored to CLOSED state.",
+                    }
+                )
             )
         self.breaker_state = "CLOSED"
         self.consecutive_failures = 0
@@ -199,70 +219,80 @@ class OpenSkyIngestionService:
     def evaluate_circuit(self) -> None:
         """Check if circuit is OPEN and test if cooldown expired to transition to HALF_OPEN."""
         now = time.time()
-        
+
         if self.breaker_state == "OPEN":
             if now >= self.cooldown_until:
                 self.breaker_state = "HALF_OPEN"
                 logger.info(
-                    json.dumps({
-                        "event": "CIRCUIT_HALF_OPEN",
-                        "breaker_state": self.breaker_state,
-                        "message": "Cooldown expired. Circuit transitioned to HALF_OPEN. Testing next poll."
-                    })
+                    json.dumps(
+                        {
+                            "event": "CIRCUIT_HALF_OPEN",
+                            "breaker_state": self.breaker_state,
+                            "message": "Cooldown expired. Circuit transitioned to HALF_OPEN. Testing next poll.",
+                        }
+                    )
                 )
             else:
                 remaining = self.cooldown_until - now
-                logger.debug(f"Circuit breaker is OPEN. Cooldown remaining: {remaining:.1f}s")
-                raise CircuitBreakerOpenException(f"Circuit breaker is OPEN. Cooldown remaining: {remaining:.1f}s")
+                logger.debug(
+                    f"Circuit breaker is OPEN. Cooldown remaining: {remaining:.1f}s"
+                )
+                raise CircuitBreakerOpenException(
+                    f"Circuit breaker is OPEN. Cooldown remaining: {remaining:.1f}s"
+                )
 
     async def poll_api(self) -> List[List[Any]]:
         """Query OpenSky endpoint. Enforces circuit evaluation and metrics tracking."""
         self.evaluate_circuit()
-        
+
         start_time = time.time()
         try:
             res = await self.client.get(self.opensky_url)
-            latency = (time.time() - start_time) * 1000.0 # ms
+            latency = (time.time() - start_time) * 1000.0  # ms
             runtime_metrics.last_poll_latency_ms = round(latency, 2)
-            
+
             if res.status_code != 200:
                 raise httpx.HTTPStatusError(
                     f"Non-200 response: {res.status_code}",
                     request=res.request,
-                    response=res
+                    response=res,
                 )
-                
+
             data = res.json()
             states = data.get("states") or []
-            
+
             self.update_circuit_state_on_success()
             self.last_successful_poll = datetime.now(timezone.utc)
-            
+
             # Log structured poll metric
             logger.info(
-                json.dumps({
-                    "event": "POLL_METRICS",
-                    "success": True,
-                    "record_count": len(states),
-                    "latency_ms": latency,
-                    "breaker_state": self.breaker_state,
-                    "backoff_seconds": self.backoff_seconds
-                })
+                json.dumps(
+                    {
+                        "event": "POLL_METRICS",
+                        "success": True,
+                        "record_count": len(states),
+                        "latency_ms": latency,
+                        "breaker_state": self.breaker_state,
+                        "backoff_seconds": self.backoff_seconds,
+                    }
+                )
             )
             return states
-            
+
         except Exception as e:
-            latency = (time.time() - start_time) * 1000.0 # ms
+            latency = (time.time() - start_time) * 1000.0  # ms
             runtime_metrics.last_poll_latency_ms = round(latency, 2)
             logger.error(
-                json.dumps({
-                    "event": "POLL_METRICS",
-                    "success": False,
-                    "error": str(e),
-                    "latency_ms": latency,
-                    "breaker_state": self.breaker_state,
-                    "backoff_seconds": self.backoff_seconds
-                })
+                json.dumps(
+                    {
+                        "event": "POLL_METRICS",
+                        "success": False,
+                        "error": str(e),
+                        "latency_ms": latency,
+                        "breaker_state": self.breaker_state,
+                        "backoff_seconds": self.backoff_seconds,
+                    }
+                )
             )
             self.update_circuit_state_on_failure()
             raise
@@ -272,21 +302,23 @@ class OpenSkyIngestionService:
         # Wait backoff if engaged
         if self.backoff_seconds > 0:
             await asyncio.sleep(self.backoff_seconds)
-            
+
         try:
             raw_states = await self.poll_api()
             runtime_metrics.packets_received += len(raw_states)
             normalized_count = 0
-            
+
             for vector in raw_states:
                 normalized = self.normalize_state(vector)
                 if normalized is not None:
                     await self.queue.put(normalized)
                     normalized_count += 1
-            runtime_metrics.packets_dropped += max(0, len(raw_states) - normalized_count)
+            runtime_metrics.packets_dropped += max(
+                0, len(raw_states) - normalized_count
+            )
             runtime_metrics.last_event_at = datetime.now(timezone.utc)
             runtime_metrics.source_status["opensky"] = "healthy"
-                    
+
             return normalized_count
         except CircuitBreakerOpenException:
             # Let the loop wait and retry later
@@ -299,7 +331,7 @@ class OpenSkyIngestionService:
         """Spins up the continuous async polling run loop."""
         logger.info("Starting OpenSky Ingestion polling loop...")
         await self.refresh_known_entities()
-        
+
         while True:
             await self.run_single_poll_cycle()
             await asyncio.sleep(self.poll_interval)

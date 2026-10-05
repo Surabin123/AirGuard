@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
 
 class AircraftStateResponse(BaseModel):
     id: int
@@ -17,11 +18,7 @@ class AircraftStateResponse(BaseModel):
     received_at: datetime
     source: str
 
-    model_config = {
-        "from_attributes": True,
-        "strict": True,
-        "extra": "forbid"
-    }
+    model_config = {"from_attributes": True, "strict": True, "extra": "forbid"}
 
 
 class AlertResponse(BaseModel):
@@ -38,11 +35,7 @@ class AlertResponse(BaseModel):
     is_synthetic: bool
     acknowledged: bool
 
-    model_config = {
-        "from_attributes": True,
-        "strict": True,
-        "extra": "forbid"
-    }
+    model_config = {"from_attributes": True, "strict": True, "extra": "forbid"}
 
 
 class ModelRunResponse(BaseModel):
@@ -58,11 +51,7 @@ class ModelRunResponse(BaseModel):
     f1: Optional[float] = None
     notes: str
 
-    model_config = {
-        "from_attributes": True,
-        "strict": True,
-        "extra": "forbid"
-    }
+    model_config = {"from_attributes": True, "strict": True, "extra": "forbid"}
 
 
 class SystemHealthResponse(BaseModel):
@@ -79,8 +68,4 @@ class SystemHealthResponse(BaseModel):
     last_event_at: Optional[datetime] = None
     source_status: Dict[str, str] = {}
 
-    model_config = {
-        "strict": True,
-        "extra": "forbid"
-    }
-
+    model_config = {"strict": True, "extra": "forbid"}

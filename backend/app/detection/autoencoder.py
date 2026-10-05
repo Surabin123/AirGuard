@@ -12,29 +12,26 @@ MOCK_RECEIVERS = {
     "2": (37.8044, -122.2712),  # Oakland
     "3": (37.3382, -121.8863),  # San Jose
     "4": (38.5816, -121.4944),  # Sacramento
-    "5": (36.7783, -119.4179)   # Fresno
+    "5": (36.7783, -119.4179),  # Fresno
 }
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "autoencoder.pth")
 
 # --- Autoencoder Network Architecture ---
 
+
 class AutoencoderModel(nn.Module):
     def __init__(self, input_dim: int = 4, latent_dim: int = 3):
         super(AutoencoderModel, self).__init__()
         # Compression layers
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 8),
-            nn.ReLU(),
-            nn.Linear(8, latent_dim)
+            nn.Linear(input_dim, 8), nn.ReLU(), nn.Linear(8, latent_dim)
         )
         # Reconstruction layers
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 8),
-            nn.ReLU(),
-            nn.Linear(8, input_dim)
+            nn.Linear(latent_dim, 8), nn.ReLU(), nn.Linear(8, input_dim)
         )
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.encoder(x))
 
@@ -72,10 +69,9 @@ class UnsupervisedAutoencoder:
 
 # --- Trilateration Plausibility Check ---
 
+
 def check_trilateration_plausibility(
-    aircraft_lat: float,
-    aircraft_lon: float,
-    sensors: List[str]
+    aircraft_lat: float, aircraft_lon: float, sensors: List[str]
 ) -> Tuple[float, str, Dict[str, Any]]:
     """Verify that the reporting sensors are within physically plausible range.
 
@@ -88,7 +84,11 @@ def check_trilateration_plausibility(
 
     # Degrade gracefully if data is sparse
     if len(valid_sensors) < 2:
-        return 1.0, "inconclusive", {"reason": "insufficient sensor data", "sensors_evaluated": valid_sensors}
+        return (
+            1.0,
+            "inconclusive",
+            {"reason": "insufficient sensor data", "sensors_evaluated": valid_sensors},
+        )
 
     # Haversine distance calculator
     def haversine(lat1, lon1, lat2, lon2):
@@ -97,8 +97,10 @@ def check_trilateration_plausibility(
         p2 = math.radians(lat2)
         dp = math.radians(lat2 - lat1)
         dl = math.radians(lon2 - lon1)
-        a = (math.sin(dp/2.0)**2) + math.cos(p1) * math.cos(p2) * (math.sin(dl/2.0)**2)
-        return R * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0-a))
+        a = (math.sin(dp / 2.0) ** 2) + math.cos(p1) * math.cos(p2) * (
+            math.sin(dl / 2.0) ** 2
+        )
+        return R * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
     distances = []
     for s_id in valid_sensors:
@@ -113,7 +115,7 @@ def check_trilateration_plausibility(
         "sensors_evaluated": valid_sensors,
         "distances_km": distances,
         "max_distance_km": max_dist,
-        "avg_distance_km": avg_dist
+        "avg_distance_km": avg_dist,
     }
 
     # Physical Boundary: Line-of-sight limit for typical ADS-B ground stations is ~350 km.
@@ -129,12 +131,13 @@ def check_trilateration_plausibility(
 
 # --- Combined Scoring Logic ---
 
+
 def combine_scores(
     rule_flags: List[bool],
     ensemble_score: float,
     autoencoder_score: float,
     trilateration_consistency: float,
-    threshold: float = 0.7
+    threshold: float = 0.7,
 ) -> Tuple[float, bool]:
     """Combines rule, ensemble, autoencoder, and trilateration signals into a risk score.
 
@@ -145,9 +148,9 @@ def combine_scores(
     - Trilateration Inconsistency (W_trilateration = 0.10): Geometric consistency (1.0 - consistency).
 
     Score Summation:
-        combined_risk = 0.40 * (any(rule_flags)) 
-                        + 0.30 * ensemble_score 
-                        + 0.20 * autoencoder_score 
+        combined_risk = 0.40 * (any(rule_flags))
+                        + 0.30 * ensemble_score
+                        + 0.20 * autoencoder_score
                         + 0.10 * (1.0 - trilateration_consistency)
 
     Returns:
@@ -165,14 +168,14 @@ def combine_scores(
 
     # Calculate weighted combined risk score
     combined_risk = (
-        (w_rules * rule_risk) +
-        (w_ensemble * ensemble_score) +
-        (w_autoencoder * autoencoder_score) +
-        (w_trilateration * trilateration_inconsistency)
+        (w_rules * rule_risk)
+        + (w_ensemble * ensemble_score)
+        + (w_autoencoder * autoencoder_score)
+        + (w_trilateration * trilateration_inconsistency)
     )
 
     # Ensure score is strictly bounded to [0.0, 1.0]
     combined_risk = min(1.0, max(0.0, combined_risk))
-    
+
     is_triggered = combined_risk >= threshold
     return combined_risk, is_triggered

@@ -1,4 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List, Optional
@@ -15,9 +23,22 @@ from reportlab.lib import colors
 
 from app.core.database import get_db
 from app.core.limiter import limiter
+from app.core.queue import ingestion_queue
+from app.core.rule_config import active_rule_config
 from app.models import AircraftState, Alert, Geofence, Incident, ModelRun
-from app.api.schemas import AircraftStateResponse, AlertResponse, ModelRunResponse, SystemHealthResponse
+from app.api.schemas import (
+    AircraftStateResponse,
+    AlertResponse,
+    ModelRunResponse,
+    SystemHealthResponse,
+)
 from app.core.realtime import incidents, live_registry, runtime_metrics
+from app.detection.rules import (
+    check_altitude_velocity_mismatch,
+    check_duplicate_icao,
+    check_impossible_climb_rate,
+    check_position_jump,
+)
 
 router = APIRouter()
 
@@ -39,7 +60,9 @@ async def list_geofences(request: Request, db: AsyncSession = Depends(get_db)):
 
 @router.post("/geofences")
 @limiter.limit("20/minute")
-async def create_geofence(request: Request, payload: GeofencePayload, db: AsyncSession = Depends(get_db)):
+async def create_geofence(
+    request: Request, payload: GeofencePayload, db: AsyncSession = Depends(get_db)
+):
     geofence = Geofence(**payload.model_dump(), created_at=datetime.now(timezone.utc))
     db.add(geofence)
     await db.commit()
@@ -49,7 +72,12 @@ async def create_geofence(request: Request, payload: GeofencePayload, db: AsyncS
 
 @router.patch("/geofences/{geofence_id}")
 @limiter.limit("30/minute")
-async def update_geofence(request: Request, geofence_id: int, payload: GeofencePayload, db: AsyncSession = Depends(get_db)):
+async def update_geofence(
+    request: Request,
+    geofence_id: int,
+    payload: GeofencePayload,
+    db: AsyncSession = Depends(get_db),
+):
     geofence = await db.get(Geofence, geofence_id)
     if not geofence:
         raise HTTPException(status_code=404, detail="Geofence not found")
@@ -62,7 +90,9 @@ async def update_geofence(request: Request, geofence_id: int, payload: GeofenceP
 
 @router.delete("/geofences/{geofence_id}")
 @limiter.limit("20/minute")
-async def delete_geofence(request: Request, geofence_id: int, db: AsyncSession = Depends(get_db)):
+async def delete_geofence(
+    request: Request, geofence_id: int, db: AsyncSession = Depends(get_db)
+):
     geofence = await db.get(Geofence, geofence_id)
     if not geofence:
         raise HTTPException(status_code=404, detail="Geofence not found")
@@ -70,8 +100,10 @@ async def delete_geofence(request: Request, geofence_id: int, db: AsyncSession =
     await db.commit()
     return {"deleted": True, "id": geofence_id}
 
+
 # Keep track of service startup time for session reporting
 START_TIME = datetime.now(timezone.utc)
+
 
 # WebSocket Connection Manager
 class ConnectionManager:
@@ -93,6 +125,7 @@ class ConnectionManager:
             except Exception:
                 pass
 
+
 manager = ConnectionManager()
 
 # Most recent values sampled from the active ingestion service.
@@ -100,8 +133,9 @@ SYSTEM_STATS = {
     "poll_latency_ms": 0.0,
     "queue_depth": 0,
     "circuit_breaker_state": "UNKNOWN",
-    "last_successful_poll": None
+    "last_successful_poll": None,
 }
+
 
 @router.get("/aircraft", response_model=List[AircraftStateResponse])
 @limiter.limit("50/minute")
@@ -109,7 +143,7 @@ async def get_aircraft(
     request: Request,
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Retrieve recent aircraft states, paginated."""
     result = await db.execute(
@@ -127,7 +161,7 @@ async def get_all_aircraft_history(
     request: Request,
     start: datetime = Query(...),
     end: datetime = Query(...),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Retrieve historical states for all aircraft within a time range."""
     result = await db.execute(
@@ -146,7 +180,7 @@ async def get_aircraft_history(
     icao24: str,
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Retrieve historical reports for a specific aircraft address (ICAO 24-bit)."""
     result = await db.execute(
@@ -175,7 +209,9 @@ async def replay_aircraft_history(
         query = query.where(AircraftState.received_at >= start)
     if end:
         query = query.where(AircraftState.received_at <= end)
-    result = await db.execute(query.order_by(AircraftState.received_at.asc()).limit(limit))
+    result = await db.execute(
+        query.order_by(AircraftState.received_at.asc()).limit(limit)
+    )
     return result.scalars().all()
 
 
@@ -187,16 +223,16 @@ async def get_alerts(
     icao24: Optional[str] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Retrieve security anomaly alerts, filterable by acknowledged state and ICAO code."""
     query = select(Alert)
-    
+
     if acknowledged is not None:
         query = query.where(Alert.acknowledged == acknowledged)
     if icao24 is not None:
         query = query.where(Alert.icao24 == icao24.lower())
-        
+
     result = await db.execute(
         query.order_by(Alert.detected_at.desc()).limit(limit).offset(offset)
     )
@@ -206,18 +242,14 @@ async def get_alerts(
 @router.post("/alerts/{id}/acknowledge", response_model=AlertResponse)
 @limiter.limit("20/minute")
 async def acknowledge_alert(
-    request: Request,
-    id: int,
-    db: AsyncSession = Depends(get_db)
+    request: Request, id: int, db: AsyncSession = Depends(get_db)
 ):
     """Acknowledge a specific security alert."""
-    result = await db.execute(
-        select(Alert).where(Alert.id == id)
-    )
+    result = await db.execute(select(Alert).where(Alert.id == id))
     alert = result.scalar_one_or_none()
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
-        
+
     alert.acknowledged = True
     await db.commit()
     await db.refresh(alert)
@@ -229,7 +261,7 @@ async def acknowledge_alert(
 async def get_model_runs(
     request: Request,
     limit: int = Query(default=50, ge=1, le=100),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Retrieve historical machine learning model evaluation runs."""
     result = await db.execute(
@@ -243,7 +275,9 @@ async def get_model_runs(
 async def get_system_health(request: Request):
     """Get system ingestion statistics, queue depths, and circuit-breaker status."""
     live_states = await live_registry.snapshot()
-    stale_count = sum(1 for state in live_states if state.get("status") in {"stale", "lost"})
+    stale_count = sum(
+        1 for state in live_states if state.get("status") in {"stale", "lost"}
+    )
     return SystemHealthResponse(
         poll_latency_ms=SYSTEM_STATS["poll_latency_ms"],
         queue_depth=SYSTEM_STATS["queue_depth"],
@@ -256,7 +290,7 @@ async def get_system_health(request: Request):
         active_aircraft=len(live_states),
         stale_aircraft=stale_count,
         last_event_at=runtime_metrics.last_event_at,
-        source_status=dict(runtime_metrics.source_status)
+        source_status=dict(runtime_metrics.source_status),
     )
 
 
@@ -290,6 +324,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 class TelemetryPayload(BaseModel):
     """Normalized telemetry contract for live, authorized data sources."""
+
     icao24: str
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
@@ -314,11 +349,15 @@ class RouteWaypoint(BaseModel):
 
 TelemetryPayload.model_rebuild()
 
+
 @router.post("/inject")
 @limiter.limit("60/minute")
 async def inject_anomaly(request: Request):
     """Synthetic injection is disabled; live telemetry must come from an authorized source."""
-    raise HTTPException(status_code=410, detail="Synthetic anomaly injection is disabled. Submit real normalized telemetry to /api/v1/ingest.")
+    raise HTTPException(
+        status_code=410,
+        detail="Synthetic anomaly injection is disabled. Submit real normalized telemetry to /api/v1/ingest.",
+    )
 
 
 @router.post("/ingest")
@@ -329,7 +368,11 @@ async def ingest_telemetry(request: Request, payload: TelemetryPayload):
     record["icao24"] = record["icao24"].strip().lower()
     record["received_at"] = record["received_at"] or datetime.now(timezone.utc)
     record["metadata"] = {"is_known_entity": False, "known_entity_label": None}
-    record["source"] = payload.source if not payload.receiver_id else f"{payload.source}:{payload.receiver_id}"
+    record["source"] = (
+        payload.source
+        if not payload.receiver_id
+        else f"{payload.source}:{payload.receiver_id}"
+    )
     runtime_metrics.packets_received += 1
     runtime_metrics.source_status[payload.source] = "healthy"
     await ingestion_queue.put(record)
@@ -343,7 +386,9 @@ async def get_incidents(
     limit: int = Query(default=100, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(Incident).order_by(Incident.created_at.desc()).limit(limit))
+    result = await db.execute(
+        select(Incident).order_by(Incident.created_at.desc()).limit(limit)
+    )
     return result.scalars().all()
 
 
@@ -356,7 +401,14 @@ class IncidentUpdatePayload(BaseModel):
 @limiter.limit("60/minute")
 async def get_live_capabilities(request: Request):
     return {
-        "live_state_fields": ["position", "altitude", "velocity", "vertical_rate", "squawk", "source"],
+        "live_state_fields": [
+            "position",
+            "altitude",
+            "velocity",
+            "vertical_rate",
+            "squawk",
+            "source",
+        ],
         "emergency_squawk_codes": ["7500", "7600", "7700"],
         "rapid_descent_detection": True,
         "filed_route_deviation": {
@@ -381,7 +433,13 @@ async def update_incident(
     payload: IncidentUpdatePayload,
     db: AsyncSession = Depends(get_db),
 ):
-    if payload.status not in {"new", "investigating", "acknowledged", "resolved", "archived"}:
+    if payload.status not in {
+        "new",
+        "investigating",
+        "acknowledged",
+        "resolved",
+        "archived",
+    }:
         raise HTTPException(status_code=400, detail="Unsupported incident status")
     result = await db.execute(select(Incident).where(Incident.id == incident_id))
     incident = result.scalar_one_or_none()
@@ -391,25 +449,40 @@ async def update_incident(
     incident.status = payload.status
     incident.updated_at = at
     timeline = list(incident.timeline or [])
-    timeline.append({
-        "at": at.isoformat(),
-        "type": "operator_status_change",
-        "signals": [f"status:{payload.status}"],
-    })
+    timeline.append(
+        {
+            "at": at.isoformat(),
+            "type": "operator_status_change",
+            "signals": [f"status:{payload.status}"],
+        }
+    )
     incident.timeline = timeline
     if payload.comment:
         comments = list(incident.comments or [])
         comments.append({"at": at.isoformat(), "text": payload.comment})
         incident.comments = comments
-        incident.timeline = timeline + [{"at": at.isoformat(), "type": "operator_comment", "text": payload.comment, "signals": []}]
+        incident.timeline = timeline + [
+            {
+                "at": at.isoformat(),
+                "type": "operator_comment",
+                "text": payload.comment,
+                "signals": [],
+            }
+        ]
     await db.commit()
     await db.refresh(incident)
     incident_payload = {
-        "id": incident.id, "icao24": incident.icao24, "status": incident.status,
-        "created_at": incident.created_at.isoformat(), "updated_at": incident.updated_at.isoformat(),
-        "risk_score": incident.risk_score, "reason": incident.reason,
-        "rule_flags": incident.rule_flags, "comments": incident.comments,
-        "timeline": incident.timeline, "source": incident.source,
+        "id": incident.id,
+        "icao24": incident.icao24,
+        "status": incident.status,
+        "created_at": incident.created_at.isoformat(),
+        "updated_at": incident.updated_at.isoformat(),
+        "risk_score": incident.risk_score,
+        "reason": incident.reason,
+        "rule_flags": incident.rule_flags,
+        "comments": incident.comments,
+        "timeline": incident.timeline,
+        "source": incident.source,
     }
     incidents[incident.id] = incident_payload
     await manager.broadcast({"event": "INCIDENT_UPDATED", "payload": incident_payload})
@@ -418,42 +491,35 @@ async def update_incident(
 
 @router.get("/reports/session")
 @limiter.limit("5/minute")
-async def generate_session_report(
-    request: Request,
-    db: AsyncSession = Depends(get_db)
-):
+async def generate_session_report(request: Request, db: AsyncSession = Depends(get_db)):
     """Generate a high-fidelity PDF session report including stats, latest model run, and top 5 risk alerts with SHAP explanations."""
     # 1. Gather Session Metrics
     duration = datetime.now(timezone.utc) - START_TIME
     hours, remainder = divmod(int(duration.total_seconds()), 3600)
     minutes, seconds = divmod(remainder, 60)
     duration_str = f"{hours}h {minutes}m {seconds}s"
-    
+
     # Tracked aircraft count
-    aircraft_count_result = await db.execute(
-        select(AircraftState.icao24).distinct()
-    )
+    aircraft_count_result = await db.execute(select(AircraftState.icao24).distinct())
     tracked_aircraft_count = len(aircraft_count_result.scalars().all())
-    
+
     # Alerts count
-    alerts_result = await db.execute(
-        select(Alert)
-    )
+    alerts_result = await db.execute(select(Alert))
     all_alerts = alerts_result.scalars().all()
     total_alerts = len(all_alerts)
-    
+
     # Alerts by type
     alerts_by_type = {}
     for a in all_alerts:
         for flag in a.rule_flags:
             alerts_by_type[flag] = alerts_by_type.get(flag, 0) + 1
-            
+
     # Latest Model Run
     model_run_result = await db.execute(
         select(ModelRun).order_by(ModelRun.run_at.desc()).limit(1)
     )
     latest_run = model_run_result.scalar_one_or_none()
-    
+
     # Top 5 highest-risk alerts
     top_alerts_result = await db.execute(
         select(Alert).order_by(Alert.combined_risk_score.desc()).limit(5)
@@ -465,156 +531,244 @@ async def generate_session_report(
     doc = SimpleDocTemplate(
         buffer,
         pagesize=letter,
-        rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36,
     )
-    
+
     styles = getSampleStyleSheet()
-    
+
     title_style = ParagraphStyle(
-        'ReportTitle',
-        parent=styles['Heading1'],
-        fontName='Helvetica-Bold',
+        "ReportTitle",
+        parent=styles["Heading1"],
+        fontName="Helvetica-Bold",
         fontSize=20,
         leading=24,
-        textColor=colors.HexColor('#0ea5e9'),
-        spaceAfter=12
+        textColor=colors.HexColor("#0ea5e9"),
+        spaceAfter=12,
     )
-    
+
     h2_style = ParagraphStyle(
-        'SectionHeader',
-        parent=styles['Heading2'],
-        fontName='Helvetica-Bold',
+        "SectionHeader",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
         fontSize=12,
         leading=16,
-        textColor=colors.HexColor('#0f172a'),
+        textColor=colors.HexColor("#0f172a"),
         spaceBefore=12,
-        spaceAfter=6
+        spaceAfter=6,
     )
-    
+
     body_style = ParagraphStyle(
-        'ReportBody',
-        parent=styles['BodyText'],
-        fontName='Helvetica',
+        "ReportBody",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
         fontSize=9,
         leading=13,
-        textColor=colors.HexColor('#334155')
+        textColor=colors.HexColor("#334155"),
     )
 
     bold_body_style = ParagraphStyle(
-        'ReportBodyBold',
-        parent=body_style,
-        fontName='Helvetica-Bold'
+        "ReportBodyBold", parent=body_style, fontName="Helvetica-Bold"
     )
-    
+
     story = []
-    
+
     # Header Title
     story.append(Paragraph("AIRGUARD // SESSION AUDIT REPORT", title_style))
-    story.append(Paragraph(f"Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC", body_style))
+    story.append(
+        Paragraph(
+            f"Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
+            body_style,
+        )
+    )
     story.append(Spacer(1, 10))
-    
+
     # Session Details Table
     story.append(Paragraph("1. Session Metrics Summary", h2_style))
     stats_data = [
-        [Paragraph("Session Duration", bold_body_style), Paragraph(duration_str, body_style)],
-        [Paragraph("Total Tracked Aircraft", bold_body_style), Paragraph(str(tracked_aircraft_count), body_style)],
-        [Paragraph("Total Security Alerts", bold_body_style), Paragraph(str(total_alerts), body_style)]
+        [
+            Paragraph("Session Duration", bold_body_style),
+            Paragraph(duration_str, body_style),
+        ],
+        [
+            Paragraph("Total Tracked Aircraft", bold_body_style),
+            Paragraph(str(tracked_aircraft_count), body_style),
+        ],
+        [
+            Paragraph("Total Security Alerts", bold_body_style),
+            Paragraph(str(total_alerts), body_style),
+        ],
     ]
     t1 = Table(stats_data, colWidths=[200, 300])
-    t1.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#f8fafc')),
-        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
-        ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor('#94a3b8')),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
-        ('TOPPADDING', (0,0), (-1,-1), 6),
-    ]))
+    t1.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#94a3b8")),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
     story.append(t1)
     story.append(Spacer(1, 12))
-    
+
     # Alerts By Type Table
     story.append(Paragraph("2. Alerts Distribution by Rule Type", h2_style))
-    type_data = [[Paragraph("Rule Type", bold_body_style), Paragraph("Count", bold_body_style)]]
+    type_data = [
+        [Paragraph("Rule Type", bold_body_style), Paragraph("Count", bold_body_style)]
+    ]
     if len(alerts_by_type) == 0:
-        type_data.append([Paragraph("No alerts logged", body_style), Paragraph("0", body_style)])
+        type_data.append(
+            [Paragraph("No alerts logged", body_style), Paragraph("0", body_style)]
+        )
     for k, v in alerts_by_type.items():
         type_data.append([Paragraph(k, body_style), Paragraph(str(v), body_style)])
     t2 = Table(type_data, colWidths=[200, 300])
-    t2.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#e2e8f0')),
-        ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
-        ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor('#94a3b8')),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
-        ('TOPPADDING', (0,0), (-1,-1), 6),
-    ]))
+    t2.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#94a3b8")),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
     story.append(t2)
     story.append(Spacer(1, 12))
-    
+
     # Model Run Precision/Recall Table
     story.append(Paragraph("3. Active Classifier Model Verification", h2_style))
     if latest_run:
         mr_data = [
-            [Paragraph("Attribute", bold_body_style), Paragraph("Value", bold_body_style)],
-            [Paragraph("Model Version", body_style), Paragraph(latest_run.model_version, body_style)],
-            [Paragraph("Precision", body_style), Paragraph(f"{latest_run.precision:.4f}" if latest_run.precision is not None else "Unavailable (no labeled normal samples)", body_style)],
-            [Paragraph("Recall", body_style), Paragraph(f"{latest_run.recall:.4f}" if latest_run.recall is not None else "Unavailable (no labeled anomaly samples)", body_style)],
-            [Paragraph("F1 Score", body_style), Paragraph(f"{latest_run.f1:.4f}" if latest_run.f1 is not None else "Unavailable (requires both labeled classes)", body_style)],
-            [Paragraph("Notes / Training Set size", body_style), Paragraph(latest_run.notes or "N/A", body_style)],
+            [
+                Paragraph("Attribute", bold_body_style),
+                Paragraph("Value", bold_body_style),
+            ],
+            [
+                Paragraph("Model Version", body_style),
+                Paragraph(latest_run.model_version, body_style),
+            ],
+            [
+                Paragraph("Precision", body_style),
+                Paragraph(
+                    (
+                        f"{latest_run.precision:.4f}"
+                        if latest_run.precision is not None
+                        else "Unavailable (no labeled normal samples)"
+                    ),
+                    body_style,
+                ),
+            ],
+            [
+                Paragraph("Recall", body_style),
+                Paragraph(
+                    (
+                        f"{latest_run.recall:.4f}"
+                        if latest_run.recall is not None
+                        else "Unavailable (no labeled anomaly samples)"
+                    ),
+                    body_style,
+                ),
+            ],
+            [
+                Paragraph("F1 Score", body_style),
+                Paragraph(
+                    (
+                        f"{latest_run.f1:.4f}"
+                        if latest_run.f1 is not None
+                        else "Unavailable (requires both labeled classes)"
+                    ),
+                    body_style,
+                ),
+            ],
+            [
+                Paragraph("Notes / Training Set size", body_style),
+                Paragraph(latest_run.notes or "N/A", body_style),
+            ],
         ]
     else:
         mr_data = [
-            [Paragraph("Status", bold_body_style), Paragraph("No model runs recorded yet", body_style)]
+            [
+                Paragraph("Status", bold_body_style),
+                Paragraph("No model runs recorded yet", body_style),
+            ]
         ]
     t3 = Table(mr_data, colWidths=[200, 300])
-    t3.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#e2e8f0')),
-        ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
-        ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor('#94a3b8')),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
-        ('TOPPADDING', (0,0), (-1,-1), 6),
-    ]))
+    t3.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#94a3b8")),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
     story.append(t3)
     story.append(Spacer(1, 12))
-    
+
     # Top 5 Highest Risk Alerts
-    story.append(Paragraph("4. Top 5 Highest Risk Anomalies & SHAP Explanations", h2_style))
+    story.append(
+        Paragraph("4. Top 5 Highest Risk Anomalies & SHAP Explanations", h2_style)
+    )
     if len(top_alerts) == 0:
         story.append(Paragraph("No security alerts logged during session.", body_style))
     else:
         for idx, alert in enumerate(top_alerts, 1):
-            story.append(Paragraph(f"<b>Anomaly {idx}: {alert.callsign} ({alert.icao24.upper()})</b>", bold_body_style))
-            story.append(Paragraph(f"Combined Risk Score: <b>{alert.combined_risk_score:.4f}</b>", body_style))
+            story.append(
+                Paragraph(
+                    f"<b>Anomaly {idx}: {alert.callsign} ({alert.icao24.upper()})</b>",
+                    bold_body_style,
+                )
+            )
+            story.append(
+                Paragraph(
+                    f"Combined Risk Score: <b>{alert.combined_risk_score:.4f}</b>",
+                    body_style,
+                )
+            )
             story.append(Paragraph(f"Reason: <i>{alert.reason_text}</i>", body_style))
-            
+
             # Map SHAP values if present
             shap_text = "N/A"
-            if isinstance(alert.shap_explanation, dict) and "shap" in alert.shap_explanation:
+            if (
+                isinstance(alert.shap_explanation, dict)
+                and "shap" in alert.shap_explanation
+            ):
                 shap_list = alert.shap_explanation["shap"]
                 if isinstance(shap_list, dict):
-                    shap_items = [f"{k}: {v:.4f}" for k, v in shap_list.items() if v > 0]
-                    shap_text = ", ".join(shap_items) if len(shap_items) > 0 else "Low feature contributions"
-            
+                    shap_items = [
+                        f"{k}: {v:.4f}" for k, v in shap_list.items() if v > 0
+                    ]
+                    shap_text = (
+                        ", ".join(shap_items)
+                        if len(shap_items) > 0
+                        else "Low feature contributions"
+                    )
+
             story.append(Paragraph(f"SHAP Explanations: {shap_text}", body_style))
             story.append(Spacer(1, 6))
 
     doc.build(story)
     buffer.seek(0)
-    
+
     return StreamingResponse(
         buffer,
         media_type="application/pdf",
-        headers={"Content-Disposition": "attachment;filename=airguard_session_report.pdf"}
+        headers={
+            "Content-Disposition": "attachment;filename=airguard_session_report.pdf"
+        },
     )
 
-
-from app.core.rule_config import active_rule_config
-from app.detection.rules import (
-    check_impossible_climb_rate,
-    check_altitude_velocity_mismatch,
-    check_position_jump,
-    check_duplicate_icao
-)
 
 class ConfigUpdatePayload(BaseModel):
     max_implied_speed_kmh: float
@@ -624,10 +778,8 @@ class ConfigUpdatePayload(BaseModel):
     max_ground_speed_ms: float
     min_flight_speed_ms: float
 
-    model_config = {
-        "strict": True,
-        "extra": "forbid"
-    }
+    model_config = {"strict": True, "extra": "forbid"}
+
 
 @router.get("/config")
 @limiter.limit("30/minute")
@@ -638,10 +790,7 @@ async def get_current_config(request: Request):
 
 @router.post("/config")
 @limiter.limit("10/minute")
-async def update_thresholds_config(
-    request: Request,
-    payload: ConfigUpdatePayload
-):
+async def update_thresholds_config(request: Request, payload: ConfigUpdatePayload):
     """Update active telemetry rules check thresholds."""
     active_rule_config.max_implied_speed_kmh = payload.max_implied_speed_kmh
     active_rule_config.duplicate_icao_dist_km = payload.duplicate_icao_dist_km
@@ -655,19 +804,18 @@ async def update_thresholds_config(
 @router.post("/model-runs/replay", response_model=ModelRunResponse)
 @limiter.limit("5/minute")
 async def replay_session_validation(
-    request: Request,
-    db: AsyncSession = Depends(get_db)
+    request: Request, db: AsyncSession = Depends(get_db)
 ):
     """Replay stored telemetry; calculate only metrics supported by recorded labels."""
     # 1. Fetch historical states and alerts
     states_result = await db.execute(
-        select(AircraftState).order_by(AircraftState.icao24, AircraftState.received_at.asc())
+        select(AircraftState).order_by(
+            AircraftState.icao24, AircraftState.received_at.asc()
+        )
     )
     all_states = states_result.scalars().all()
 
-    alerts_result = await db.execute(
-        select(Alert)
-    )
+    alerts_result = await db.execute(select(Alert))
     all_alerts = alerts_result.scalars().all()
 
     # Map state_id to whether it was a ground truth synthetic anomaly
@@ -695,14 +843,22 @@ async def replay_session_validation(
         if len(history) > 0:
             prev = history[-1]
             rule_jump, _, _ = check_position_jump(
-                current_lat=state.latitude, current_lon=state.longitude, current_time=state.received_at,
-                prev_lat=prev.latitude, prev_lon=prev.longitude, prev_time=prev.received_at,
-                config=active_rule_config
+                current_lat=state.latitude,
+                current_lon=state.longitude,
+                current_time=state.received_at,
+                prev_lat=prev.latitude,
+                prev_lon=prev.longitude,
+                prev_time=prev.received_at,
+                config=active_rule_config,
             )
             rule_dup, _, _ = check_duplicate_icao(
-                lat_a=state.latitude, lon_a=state.longitude, time_a=state.received_at,
-                lat_b=prev.latitude, lon_b=prev.longitude, time_b=prev.received_at,
-                config=active_rule_config
+                lat_a=state.latitude,
+                lon_a=state.longitude,
+                time_a=state.received_at,
+                lat_b=prev.latitude,
+                lon_b=prev.longitude,
+                time_b=prev.received_at,
+                config=active_rule_config,
             )
 
         predicted_anomaly = rule_climb or rule_alt_vel or rule_jump or rule_dup
@@ -731,9 +887,11 @@ async def replay_session_validation(
         precision=None,
         recall=recall,
         f1=None,
-        notes=(f"Positive-only labeled replay: {TP + FN} labeled anomalies; recall is measurable. "
-               "Precision/F1 and false-positive/true-negative counts require labeled normal observations. "
-               f"Thresholds: climb={active_rule_config.max_vertical_rate_ms}m/s, speed={active_rule_config.max_implied_speed_kmh}km/h")
+        notes=(
+            f"Positive-only labeled replay: {TP + FN} labeled anomalies; recall is measurable. "
+            "Precision/F1 and false-positive/true-negative counts require labeled normal observations. "
+            f"Thresholds: climb={active_rule_config.max_vertical_rate_ms}m/s, speed={active_rule_config.max_implied_speed_kmh}km/h"
+        ),
     )
     db.add(db_run)
     await db.commit()

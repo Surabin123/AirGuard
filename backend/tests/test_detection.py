@@ -7,28 +7,33 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from app.detection.service import DetectionService
 from app.detection.rules import RuleConfig
 
+
 @pytest.mark.asyncio
 async def test_detection_service_integration():
     queue = asyncio.Queue()
-    
+
     # 1. Mock DB Session Maker
     db_session = MagicMock()
     async_db_session = AsyncMock()
     db_session.return_value = async_db_session
-    
+
     async_db_session.commit = AsyncMock()
     async_db_session.refresh = AsyncMock()
-    
+
     # Mock refresh to inject database row ID
     def mock_refresh(obj):
         obj.id = 12345
         return None
+
     async_db_session.refresh.side_effect = mock_refresh
 
     # 2. Mock Machine Learning Estimators
     ensemble = MagicMock()
-    ensemble.predict_anomaly.return_value = (0.2, {"top_features": [], "base_value": 0.05})
-    
+    ensemble.predict_anomaly.return_value = (
+        0.2,
+        {"top_features": [], "base_value": 0.05},
+    )
+
     autoencoder = MagicMock()
     autoencoder.compute_anomaly_score.return_value = 0.1
 
@@ -38,7 +43,7 @@ async def test_detection_service_integration():
         db_session_maker=db_session,
         ensemble_model=ensemble,
         autoencoder_model=autoencoder,
-        rule_config=RuleConfig()
+        rule_config=RuleConfig(),
     )
 
     # Mock logger to verify structured log fields
@@ -59,9 +64,9 @@ async def test_detection_service_integration():
             "on_ground": False,
             "received_at": t1,
             "source": "opensky",
-            "metadata": {"is_known_entity": False, "known_entity_label": None}
+            "metadata": {"is_known_entity": False, "known_entity_label": None},
         }
-        
+
         # Position jumps 560 km in 1 min (implied speed ~33,600 km/h)
         state_2 = {
             "icao24": "a1b2c3",
@@ -75,7 +80,7 @@ async def test_detection_service_integration():
             "on_ground": False,
             "received_at": t2,
             "source": "opensky",
-            "metadata": {"is_known_entity": False, "known_entity_label": None}
+            "metadata": {"is_known_entity": False, "known_entity_label": None},
         }
 
         await service.process_record(state_1)
@@ -83,8 +88,10 @@ async def test_detection_service_integration():
 
         # Assert correct Alert created in DB
         added_objects = [args[0] for args, _ in async_db_session.add.call_args_list]
-        alerts_added = [obj for obj in added_objects if obj.__class__.__name__ == "Alert"]
-        
+        alerts_added = [
+            obj for obj in added_objects if obj.__class__.__name__ == "Alert"
+        ]
+
         assert len(alerts_added) == 1
         alert = alerts_added[0]
         assert alert.icao24 == "a1b2c3"
@@ -92,9 +99,13 @@ async def test_detection_service_integration():
         assert "Implied speed" in alert.reason_text
 
         # Assert correct audit decision logged
-        log_payloads = [json.loads(args[0]) for args, _ in mock_logger.info.call_args_list if args]
-        alert_log = next((p for p in log_payloads if p.get("event") == "AUDIT_DECISION_ALERT"), None)
-        
+        log_payloads = [
+            json.loads(args[0]) for args, _ in mock_logger.info.call_args_list if args
+        ]
+        alert_log = next(
+            (p for p in log_payloads if p.get("event") == "AUDIT_DECISION_ALERT"), None
+        )
+
         assert alert_log is not None
         assert alert_log["payload"]["icao24"] == "a1b2c3"
         assert alert_log["payload"]["alert_triggered"] is True
@@ -112,24 +123,37 @@ async def test_detection_service_integration():
             "altitude_m": 5000.0,
             "velocity_ms": 150.0,
             "heading_deg": 90.0,
-            "vertical_rate_ms": 80.0, # Highly anomalous climb rate (>50 m/s)
+            "vertical_rate_ms": 80.0,  # Highly anomalous climb rate (>50 m/s)
             "on_ground": False,
             "received_at": t2,
             "source": "opensky",
-            "metadata": {"is_known_entity": True, "known_entity_label": "MILITARY_F35"}
+            "metadata": {"is_known_entity": True, "known_entity_label": "MILITARY_F35"},
         }
 
         await service.process_record(state_military)
 
         # Assert NO Alert added to DB for suppressed target
         added_objects_mil = [args[0] for args, _ in async_db_session.add.call_args_list]
-        alerts_added_mil = [obj for obj in added_objects_mil if obj.__class__.__name__ == "Alert"]
-        assert len(alerts_added_mil) == 0, "Alert was incorrectly written to database for suppressed entity"
+        alerts_added_mil = [
+            obj for obj in added_objects_mil if obj.__class__.__name__ == "Alert"
+        ]
+        assert (
+            len(alerts_added_mil) == 0
+        ), "Alert was incorrectly written to database for suppressed entity"
 
         # Assert correct suppression logging
-        log_payloads_mil = [json.loads(args[0]) for args, _ in mock_logger.info.call_args_list if args]
-        suppressed_log = next((p for p in log_payloads_mil if p.get("event") == "AUDIT_DECISION_SUPPRESSED"), None)
-        
+        log_payloads_mil = [
+            json.loads(args[0]) for args, _ in mock_logger.info.call_args_list if args
+        ]
+        suppressed_log = next(
+            (
+                p
+                for p in log_payloads_mil
+                if p.get("event") == "AUDIT_DECISION_SUPPRESSED"
+            ),
+            None,
+        )
+
         assert suppressed_log is not None
         assert suppressed_log["payload"]["icao24"] == "d81234"
         assert suppressed_log["payload"]["is_known_entity"] is True

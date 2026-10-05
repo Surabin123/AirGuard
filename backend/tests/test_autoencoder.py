@@ -1,4 +1,3 @@
-import pytest
 import numpy as np
 import torch
 
@@ -6,17 +5,18 @@ from app.detection.autoencoder import (
     AutoencoderModel,
     UnsupervisedAutoencoder,
     check_trilateration_plausibility,
-    combine_scores
+    combine_scores,
 )
 
 # --- 1. PyTorch Autoencoder Structural Tests ---
 
+
 def test_autoencoder_architecture():
     # Input dim 4, latent dim 3
     model = AutoencoderModel(input_dim=4, latent_dim=3)
-    
+
     # Assert structural forward pass
-    dummy_input = torch.randn(5, 4) # batch size 5, features 4
+    dummy_input = torch.randn(5, 4)  # batch size 5, features 4
     output = model(dummy_input)
     assert output.shape == (5, 4)
 
@@ -24,17 +24,18 @@ def test_autoencoder_architecture():
 def test_unsupervised_autoencoder_scoring():
     # Instantiate with fallback/untrained weights
     ae = UnsupervisedAutoencoder(input_dim=4, latent_dim=3)
-    
+
     # Test random input scoring
     dummy_features = np.random.normal(loc=0.0, scale=1.0, size=(4,))
     score = ae.compute_anomaly_score(dummy_features)
-    
+
     # Verify bounds
     assert 0.0 <= score <= 1.0
     assert isinstance(score, float)
 
 
 # --- 2. Trilateration Plausibility Tests ---
+
 
 def test_trilateration_plausibility():
     # SF (37.7749, -122.4194)
@@ -43,8 +44,7 @@ def test_trilateration_plausibility():
 
     # Case A: Insufficient sensors (less than 2 valid) -> Inconclusive
     consistency, reason, evidence = check_trilateration_plausibility(
-        aircraft_lat=37.7749, aircraft_lon=-122.4194,
-        sensors=["1"] # only one sensor
+        aircraft_lat=37.7749, aircraft_lon=-122.4194, sensors=["1"]  # only one sensor
     )
     assert consistency == 1.0
     assert reason == "inconclusive"
@@ -52,8 +52,7 @@ def test_trilateration_plausibility():
 
     # Case B: Consistent geometry (aircraft at SF, sensors in SF & Oakland) -> Consistent
     consistency, reason, evidence = check_trilateration_plausibility(
-        aircraft_lat=37.7749, aircraft_lon=-122.4194,
-        sensors=["1", "2"]
+        aircraft_lat=37.7749, aircraft_lon=-122.4194, sensors=["1", "2"]
     )
     assert consistency == 1.0
     assert reason == "consistent"
@@ -62,16 +61,14 @@ def test_trilateration_plausibility():
 
     # Case C: Inconsistent geometry (aircraft at SF, but Fresno sensor "5" reports it, distance ~270km, plus mock invalid sensor) -> Consistent still (distance under 350km)
     consistency, reason, evidence = check_trilateration_plausibility(
-        aircraft_lat=37.7749, aircraft_lon=-122.4194,
-        sensors=["1", "5"]
+        aircraft_lat=37.7749, aircraft_lon=-122.4194, sensors=["1", "5"]
     )
     assert consistency == 1.0
     assert reason == "consistent"
 
     # Case D: Inconsistent geometry (aircraft reported far out in Pacific Ocean, but SF & Oakland sensors report it -> distance > 1000km) -> Inconsistent!
     consistency, reason, evidence = check_trilateration_plausibility(
-        aircraft_lat=30.0000, aircraft_lon=-130.0000,
-        sensors=["1", "2"]
+        aircraft_lat=30.0000, aircraft_lon=-130.0000, sensors=["1", "2"]
     )
     assert consistency < 1.0
     assert "physically inconsistent geometry" in reason
@@ -79,6 +76,7 @@ def test_trilateration_plausibility():
 
 
 # --- 3. Combined Scoring Weight Boundary Tests ---
+
 
 def test_combined_scoring_boundaries():
     # combine_scores args: rule_flags, ensemble_score, autoencoder_score, trilateration_consistency, threshold
@@ -89,7 +87,7 @@ def test_combined_scoring_boundaries():
         ensemble_score=0.0,
         autoencoder_score=0.0,
         trilateration_consistency=1.0,
-        threshold=0.7
+        threshold=0.7,
     )
     assert risk == 0.0
     assert not triggered
@@ -100,8 +98,8 @@ def test_combined_scoring_boundaries():
         rule_flags=[False, False, False, False],
         ensemble_score=1.0,
         autoencoder_score=1.0,
-        trilateration_consistency=0.0, # consistency 0 -> inconsistency 1
-        threshold=0.7
+        trilateration_consistency=0.0,  # consistency 0 -> inconsistency 1
+        threshold=0.7,
     )
     assert abs(risk - 0.60) < 1e-5
     assert not triggered
@@ -113,7 +111,7 @@ def test_combined_scoring_boundaries():
         ensemble_score=0.0,
         autoencoder_score=0.0,
         trilateration_consistency=1.0,
-        threshold=0.7
+        threshold=0.7,
     )
     assert abs(risk - 0.40) < 1e-5
     assert not triggered
@@ -125,7 +123,7 @@ def test_combined_scoring_boundaries():
         ensemble_score=1.0,
         autoencoder_score=0.0,
         trilateration_consistency=1.0,
-        threshold=0.7
+        threshold=0.7,
     )
     assert abs(risk - 0.70) < 1e-5
     assert triggered
@@ -136,7 +134,7 @@ def test_combined_scoring_boundaries():
         ensemble_score=1.0,
         autoencoder_score=1.0,
         trilateration_consistency=0.0,
-        threshold=0.7
+        threshold=0.7,
     )
     assert abs(risk - 1.0) < 1e-5
     assert triggered
