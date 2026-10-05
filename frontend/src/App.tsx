@@ -7,14 +7,29 @@ import {
 import create from 'zustand';
 
 // Cesium and Resium imports
-import { Viewer, Entity, PointGraphics, PolylineGraphics, EllipseGraphics } from 'resium';
-import { Cartesian3, Color } from 'cesium';
+import { Viewer, Entity, PointGraphics, PolylineGraphics, EllipseGraphics, Camera, Globe } from 'resium';
+import { Cartesian3, Color, ImageryLayer, OpenStreetMapImageryProvider } from 'cesium';
 import "cesium/Build/Cesium/Widgets/widgets.css";
 
 
 const BACKEND_PORT = '8001';
 const API_BASE = `http://127.0.0.1:${BACKEND_PORT}`;
 const WS_BASE = `ws://127.0.0.1:${BACKEND_PORT}`;
+const AIRGUARD_BASE_LAYER = new ImageryLayer(new OpenStreetMapImageryProvider({
+  url: 'https://tile.openstreetmap.org/',
+  credit: '© OpenStreetMap contributors'
+}));
+const HOME_LONGITUDE = 78.9629;
+const HOME_LATITUDE = 20.5937;
+const HOME_LONGITUDE_RAD = HOME_LONGITUDE * Math.PI / 180;
+const HOME_LATITUDE_RAD = HOME_LATITUDE * Math.PI / 180;
+const HOME_POSITION = Cartesian3.fromDegrees(HOME_LONGITUDE, HOME_LATITUDE, 21_000_000);
+const HOME_DIRECTION = Cartesian3.normalize(Cartesian3.negate(HOME_POSITION, new Cartesian3()), new Cartesian3());
+const HOME_UP = Cartesian3.normalize(new Cartesian3(
+  -Math.sin(HOME_LATITUDE_RAD) * Math.cos(HOME_LONGITUDE_RAD),
+  -Math.sin(HOME_LATITUDE_RAD) * Math.sin(HOME_LONGITUDE_RAD),
+  Math.cos(HOME_LATITUDE_RAD)
+), new Cartesian3());
 
 // --- Types ---
 interface TrailPosition {
@@ -879,7 +894,7 @@ export default function App() {
                 : 'text-slate-500 hover:text-slate-300 border border-transparent'
             }`}
           >
-            ANALYTICS & CONFIG
+            ZONES + EVALUATION
           </button>
         </nav>
 
@@ -1097,7 +1112,7 @@ export default function App() {
                     : 'border-transparent text-slate-500 hover:text-slate-300'
                 }`}
               >
-                ANALYTICS & CONFIG
+                ZONES + EVALUATION
               </button>
             </div>
           </div>
@@ -1183,10 +1198,26 @@ export default function App() {
                       {dashboardTab === 'playback' ? "HISTORICAL RECONSTRUCTION" : "CESIUM 3D GLOBE OVERLAY"}
                     </span>
                   </div>
+                  {dashboardTab === 'radar' && (
+                    <button
+                      onClick={() => setDashboardTab('analytics')}
+                      className="absolute top-14 left-4 z-10 bg-slate-950/90 border border-amber-500/30 rounded px-3 py-1.5 text-[9px] font-bold tracking-wider text-amber-200 hover:border-amber-300 transition-colors"
+                    >
+                      LIVE GEOFENCES · {geofences.filter((zone) => zone.enabled).length} ACTIVE · MANAGE
+                    </button>
+                  )}
                   
                   <div className="flex-1 w-full relative" aria-label="3D Cesium map visualizing tracked targets" role="application">
                     <CesiumErrorBoundary>
-                      <Viewer full className="w-full h-full">
+                      <Viewer
+                        full
+                        className="w-full h-full"
+                        baseLayer={AIRGUARD_BASE_LAYER}
+                        baseLayerPicker={false}
+                        geocoder={false}
+                      >
+                        <Globe baseColor={Color.fromCssColorString('#17324d')} />
+                        <Camera position={HOME_POSITION} direction={HOME_DIRECTION} up={HOME_UP} />
                         {dashboardTab === 'radar' && geofences.filter((zone) => zone.enabled).map((zone) => (
                           <Entity
                             key={`geofence-${zone.id}`}
@@ -1468,7 +1499,7 @@ export default function App() {
               <div className="flex items-center justify-between border-b border-cyan-950/40 pb-4 mb-4">
                 <div>
                   <h2 className="text-sm font-bold tracking-wider text-slate-300 uppercase m-0">ALERTS AUDIT LOG RECORD</h2>
-                  <span className="text-[10px] text-slate-500">Security flags logged by Combined Score Rules & ML Ensemble</span>
+                  <span className="text-[10px] text-slate-500">Security flags logged by Combined Score Rules & ML Ensemble · Select an alert row to inspect its live evidence</span>
                 </div>
                 <div className="flex gap-2">
                   <button
